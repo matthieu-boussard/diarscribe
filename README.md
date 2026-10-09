@@ -3,7 +3,7 @@
 Transcription diarisée, par lots :
 
 - **Qui parle quand** : [`nvidia/Nemotron-3-Diarization`](https://huggingface.co/nvidia/Nemotron-3-Diarization) (Sortformer, 8 locuteurs max)
-- **Ce qui est dit** : [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) (2B, 14 langues dont le français, Apache 2.0) par défaut, ou [`microsoft/VibeVoice-ASR-HF`](https://huggingface.co/microsoft/VibeVoice-ASR-HF) (7B, accepte des mots-clés) avec `--asr vibevoice`
+- **Ce qui est dit** : [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) (2B, 14 langues dont le français, Apache 2.0) par défaut, ou au choix avec `--asr` : [`microsoft/VibeVoice-ASR-HF`](https://huggingface.co/microsoft/VibeVoice-ASR-HF), [`ibm-granite/granite-4.0-1b-speech`](https://huggingface.co/ibm-granite/granite-4.0-1b-speech), [`ibm-granite/granite-speech-4.1-2b`](https://huggingface.co/ibm-granite/granite-speech-4.1-2b), [`bofenghuang/whisper-large-v3-french`](https://huggingface.co/bofenghuang/whisper-large-v3-french)
 - **Quand chaque mot est dit** : alignement forcé CTC avec [`jonatasgrosman/wav2vec2-large-xlsr-53-french`](https://huggingface.co/jonatasgrosman/wav2vec2-large-xlsr-53-french) (l'aligneur de WhisperX pour le français)
 - **Garde anti-boucle** : les décodeurs autorégressifs peuvent répéter la même phrase en boucle ; voir plus bas.
 
@@ -49,21 +49,45 @@ Le mode `--mode turns` (un appel par tour de parole) reste disponible : attribut
 
 ### Choisir le moteur de transcription
 
-Les deux moteurs partagent tout le reste du pipeline : fenêtres, garde anti-boucle, alignement et attribution des locuteurs.
-Le JSON de VibeVoice (avec ses propres locuteurs et horodatages) est réduit à du texte.
+Tous les moteurs partagent le reste du pipeline : fenêtres, garde anti-boucle, alignement et attribution des locuteurs.
 
-| | `--asr cohere` (défaut) | `--asr vibevoice` |
-|---|---|---|
-| Taille / RAM | 2B, ~4 Go | 7B, ~17 Go en bf16 |
-| Vitesse (5 min, M4 Pro) | 8 s | ~240 s |
-| Mots-clés (`--context`) | non | oui : corrige les noms propres de la liste |
-| Langue | imposée (`--lang`) | détectée automatiquement |
-| Texte courant | plus juste, sans « euh » | garde les hésitations, hallucine davantage |
-| Lots par défaut | 16 | 1 (24 Go de Mac) ; augmenter sur GPU à grande mémoire |
+| `--asr` | Modèle | Taille | Mots-clés (`--context`) | Langue | Fenêtre max | Lots par défaut |
+|---|---|---|---|---|---|---|
+| `cohere` (défaut) | Cohere Transcribe 03-2026 | 2B | non | imposée | 30 s | 16 |
+| `vibevoice` | VibeVoice-ASR | 7B | oui | auto | 30 s | 1 (24 Go de Mac) |
+| `whisper-fr` | Whisper large-v3 affiné en français | 1,5B | oui (`prompt_ids`) | imposée | 30 s | 16 |
 
-Sur un extrait de réunion en français, `--context "craft ai, cabinet Liins, ..."` a fait passer VibeVoice
-de « Crafty Ray » et « Cabine Evans » à « Craft ai » et « cabinet Liins ». En revanche, les expressions courantes
-de la liste n'ont pas été mieux reconnues.
+Notes d'intégration :
+- **Whisper** : `generate` retire le token de fin de la ligne la plus longue du lot. La détection « budget de tokens épuisé » tient donc compte de la longueur réelle.
+
+#### Comparatif (extrait de 5 min, réunion en français, MacBook M4 Pro 24 Go)
+
+IBM Granite Speech 4.0 1B et 4.1 2B ont été évalués puis retirés des options : voir leurs lignes ci-dessous.
+
+Contexte : `--context "boussard, craft ai, cabinet Liins, gestion de patrimoine"`. Il n'y a pas de transcription de référence :
+les termes cochés sont ceux confirmés par l'utilisateur, et « écart moyen » est la distance d'édition en mots
+(hésitations exclues) avec les autres sorties. Un écart faible signifie que le modèle s'accorde avec les autres, pas qu'il a raison.
+
+| Modèle | Transcription (s) | Mots | Relances anti-boucle | Hésitations gardées | Majuscules | cabinet Liins | Craft AI | gestion de patrimoine | Écart moyen |
+|---|---|---|---|---|---|---|---|---|---|
+| Cohere Transcribe | **8** | 681 | 0 | 2 | 87 % | — | — | ✅ | 51 % |
+| VibeVoice-ASR | 257 | 720 | 2 | 32 | 85 % | — | — | — | 51 % |
+| VibeVoice-ASR + contexte | 237 | 723 | 0 | 27 | 80 % | ✅ | ✅ | — | 52 % |
+| Granite 4.0 1B | 12 | 448 | 2 | 0 | 0 % | — | — | — | 69 % |
+| Granite 4.0 1B + contexte | 12 | 430 | 2 | 0 | 0 % | — | — | ✅ | 73 % |
+| Granite 4.1 2B | 21 | 434 | 4 | 0 | 71 % | — | — | — | 64 % |
+| Granite 4.1 2B + contexte | 21 | 469 | 5 | 0 | 0 % | ✅ | — | — | 64 % |
+| Whisper large-v3 FR | 22 | 674 | **0** | 12 | 70 % | — | — | ✅ | **50 %** |
+| Whisper large-v3 FR + contexte | 29 | 597 | 5 | 7 | 68 % | ✅ | — | ✅ | 55 % |
+
+Écart deux à deux (sans contexte, VibeVoice avec) : Cohere ↔ Whisper 27 %, Cohere ↔ VibeVoice 33 %, Whisper ↔ VibeVoice 36 %,
+et Granite ↔ tous les autres 65 à 72 %.
+
+À retenir :
+- **Cohere** : le plus rapide, le plus proche du consensus, peu d'hésitations ; ne prend pas de mots-clés.
+- **Whisper FR** : très proche de Cohere en qualité (le plus proche du consensus), environ 3× plus lent, et accepte un contexte. Le contexte corrige les noms propres de la liste mais déclenche des boucles.
+- **VibeVoice** : seul à reconnaître « Craft AI » (avec contexte), garde les hésitations ; environ 30× plus lent.
+- **Granite 4.0 / 4.1** (retirés) : rapides, mais rendent ~35 % de mots en moins. Sur les échanges rapides à deux voix, ils résument ou inventent du texte (4.1 : « nommé d'après la ville de Coftea, en Moldavie… » sur un dialogue de dépannage navigateur). Ils exigeaient en plus des contournements : prompt nommant la langue (sinon 4.1 traduit en anglais), fenêtres de 12 s pour 4.0, et un correctif de `transformers` 5.19.
 
 - Dans une fenêtre, le modèle omet parfois une courte interjection prononcée par-dessus l'autre locuteur (« ok », « d'accord »).
 - `--lang` est obligatoire pour le modèle (pas de détection automatique ; `fr` par défaut). Il sert aussi à écarter les sorties dans une autre écriture.

@@ -15,7 +15,7 @@ import torch  # noqa: E402
 
 from . import output, pipeline  # noqa: E402
 from .align import Aligner  # noqa: E402
-from .asr import BACKENDS, CohereTranscriber, VibeVoiceTranscriber  # noqa: E402
+from .asr import BACKENDS, CONTEXT_BACKENDS  # noqa: E402
 from .diarize import Diarizer  # noqa: E402
 
 DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
@@ -29,22 +29,24 @@ def default_device() -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="diarscribe", description="Transcription diarisée (Nemotron-3-Diarization + Cohere Transcribe ou VibeVoice-ASR)")
+    ap = argparse.ArgumentParser(prog="diarscribe", description="Transcription diarisée (Nemotron-3-Diarization + Cohere / VibeVoice / Whisper)")
     ap.add_argument("audio", nargs="+", help="fichier(s) audio/vidéo (tout format lu par ffmpeg)")
     ap.add_argument("-o", "--output-dir", type=Path, help="dossier de sortie (défaut : à côté de l'audio)")
     ap.add_argument("-f", "--formats", default="txt,srt,json", help="formats de sortie parmi txt,srt,json")
-    ap.add_argument("--asr", choices=sorted(BACKENDS), default="cohere",
-                    help="cohere : rapide (2B) ; vibevoice : 7B, plus lent, accepte des mots-clés (--context)")
+    ap.add_argument("--asr", choices=list(BACKENDS), default="cohere",
+                    help="cohere (2B, défaut) ; vibevoice (7B) ; whisper-fr (large-v3 affiné en français). "
+                         "vibevoice et whisper-fr acceptent --context")
     ap.add_argument("-l", "--lang", choices=LANGUAGES, default="fr",
                     help="langue de l'audio (imposée à Cohere ; choix de l'aligneur) ; écarte aussi les sorties dans une autre écriture")
-    ap.add_argument("-c", "--context", help="VibeVoice seulement : contexte / mots-clés (noms propres, jargon...)")
+    ap.add_argument("-c", "--context", help="mots-clés / contexte (noms propres, jargon...) ; pas avec cohere")
     ap.add_argument("--mode", choices=["window", "turns"], default="window",
                     help="window : fenêtres continues ≤ 30 s, mots alignés puis attribués au locuteur (plus de contexte) ; "
                          "turns : un appel par tour de parole")
     ap.add_argument("--align-model", help="modèle CTC wav2vec2 pour l'alignement des mots (défaut selon --lang)")
     ap.add_argument("--no-punctuation", action="store_true", help="transcription sans ponctuation ni majuscules")
     ap.add_argument("--keep-tags", action="store_true", help="garder les balises [Silence], [Noise]...")
-    ap.add_argument("--batch-size", type=int, help="fenêtres transcrites par appel au modèle (défaut : 16 cohere, 1 vibevoice ; augmenter sur GPU à grande mémoire)")
+    ap.add_argument("--batch-size", type=int,
+                    help="fenêtres transcrites par appel (défaut : 16 cohere/whisper, 1 vibevoice ; augmenter sur GPU à grande mémoire)")
     ap.add_argument("--max-chunk", type=float, default=30.0, help="durée max d'un tour envoyé au modèle (s, ≤ 35)")
     ap.add_argument("--device", default=default_device())
     ap.add_argument("--diar-device", default=None, help="device pour la diarisation (défaut : --device)")
@@ -63,20 +65,20 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(f"format(s) inconnu(s) : {', '.join(sorted(unknown))}")
     if not 0 < args.max_chunk <= 35:
         ap.error("--max-chunk doit être dans ]0, 35] (au-delà, Cohere redécoupe lui-même l'audio)")
-    if args.context and args.asr != "vibevoice":
-        ap.error("--context n'est pris en charge que par --asr vibevoice")
+    if args.context and args.asr not in CONTEXT_BACKENDS:
+        ap.error(f"--context n'est pas pris en charge par --asr {args.asr}")
 
     print("Chargement de Nemotron-3-Diarization...", file=sys.stderr)
     diarizer = Diarizer(device=args.diar_device or args.device)
     common = dict(device=args.device, dtype=DTYPES[args.dtype], language=args.lang, max_wps=args.max_wps)
     if args.batch_size:
         common["batch_size"] = args.batch_size
-    if args.asr == "vibevoice":
-        print("Chargement de VibeVoice-ASR (≈17 Go en bf16)...", file=sys.stderr)
-        transcriber = VibeVoiceTranscriber(context=args.context, **common)
-    else:
-        print("Chargement de Cohere Transcribe...", file=sys.stderr)
-        transcriber = CohereTranscriber(punctuation=not args.no_punctuation, **common)
+    if args.asr in CONTEXT_BACKENDS:
+        common["context"] = args.context
+    if args.asr == "cohere":
+        common["punctuation"] = not args.no_punctuation
+    print(f"Chargement du modèle de transcription ({args.asr})...", file=sys.stderr)
+    transcriber = BACKENDS[args.asr](**common)
     aligner = None
     if args.mode == "window":
         print("Chargement de l'aligneur wav2vec2...", file=sys.stderr)

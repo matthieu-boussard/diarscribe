@@ -49,6 +49,8 @@ def run(
     if not turns:
         return []
 
+    # Padded windows must fit the model's input (Whisper: 30 s).
+    max_chunk_s = min(max_chunk_s, transcriber.max_input_s - 2 * pad_s)
     if mode == "window":
         if aligner is None:
             raise ValueError("le mode window demande un aligneur")
@@ -113,11 +115,13 @@ def _attribute_words(audio, results: list[list[Piece]], turns: list[Turn], align
     return segments
 
 
-def smooth_by_sentence(words: list[Word], speakers: list[int], min_run: int = 4) -> list[int]:
+def smooth_by_sentence(words: list[Word], speakers: list[int], min_run: int = 4, max_sentence: int = 40) -> list[int]:
     """One speaker per sentence (majority of words), using the ASR punctuation as sentence ends.
 
     Word timings near a turn change are fuzzy, so edge words often land on the other speaker. A run of at
     least ``min_run`` words of another speaker inside a sentence is kept: a real change without punctuation.
+    A "sentence" longer than ``max_sentence`` words means the text is not punctuated (e.g. --no-punctuation):
+    then only isolated single words are relabelled.
     """
     out = list(speakers)
     start = 0
@@ -129,14 +133,20 @@ def smooth_by_sentence(words: list[Word], speakers: list[int], min_run: int = 4)
                 # Count words, not seconds: the aligner stretches the last word of a turn into the next one.
                 weight[speakers[k]] = weight.get(speakers[k], 0.0) + 1.0 + 1e-3 * (words[k].end - words[k].start)
             major = max(weight, key=weight.get)
+            run_min = min_run if i + 1 - start <= max_sentence else 2
             k = start
             while k <= i:  # relabel minority runs shorter than min_run
                 j = k
                 while j + 1 <= i and speakers[j + 1] == speakers[k]:
                     j += 1
-                if speakers[k] != major and j - k + 1 < min_run:
+                short = j - k + 1 < run_min
+                if run_min == min_run:
+                    fill = major if short and speakers[k] != major else None
+                else:  # unpunctuated text: an isolated word takes its left neighbour's speaker
+                    fill = out[k - 1] if short and k > start and speakers[k] != out[k - 1] else None
+                if fill is not None:
                     for m in range(k, j + 1):
-                        out[m] = major
+                        out[m] = fill
                 k = j + 1
             start = i + 1
     return out

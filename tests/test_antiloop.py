@@ -167,3 +167,14 @@ def test_vibevoice_json_to_text():
     cut = '[{"Start":0,"End":2,"Speaker":0,"Content":"Salut \\"toi\\""},{"Start":2,"End":4,"Speaker":1,"Content":"ça va'
     assert vv._text(cut) == 'Salut "toi" ça va'
     assert extract_contents(cut) == ['Salut "toi"', "ça va"]
+
+
+def test_smoothing_without_punctuation_keeps_speaker_changes():
+    from diarscribe.align import Word
+    from diarscribe.pipeline import smooth_by_sentence
+
+    words = [Word(i * 0.3, i * 0.3 + 0.25, "mot") for i in range(60)]  # 60 words, no punctuation
+    raw = [0] * 30 + [1] * 29 + [0]  # real change at word 30, a stray last word
+    out = smooth_by_sentence(words, raw)
+    assert out[:30] == [0] * 30 and out[30:59] == [1] * 29  # the change survives (no global majority)
+    assert out[59] == 1  # isolated word takes its left neighbour's speaker

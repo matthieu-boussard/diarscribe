@@ -1,4 +1,4 @@
-"""Batched ASR backends (Cohere Transcribe, VibeVoice-ASR) wrapped in a shared anti-loop retry ladder.
+"""Batched ASR backends (Cohere Transcribe, VibeVoice-ASR, Whisper) wrapped in a shared anti-loop retry ladder.
 
 ``GuardedTranscriber`` owns everything backend-independent: batching, live loop stopping, diagnosis,
 retries, recursive splitting and last-resort cleanup. A backend only implements ``_generate_batch``.
@@ -18,6 +18,7 @@ from transformers import (
     CohereAsrForConditionalGeneration,
     StoppingCriteriaList,
     VibeVoiceAsrForConditionalGeneration,
+    WhisperForConditionalGeneration,
 )
 
 from .antiloop import LoopStoppingCriteria, collapse_repetitions, diagnose
@@ -52,6 +53,8 @@ class GuardedTranscriber:
     """Backend-independent batching + anti-loop logic. Subclasses set ``sample_rate`` and ``_generate_batch``."""
 
     sample_rate: int
+    max_input_s: float = 3600.0  # longest audio span the model accepts in one call
+    supports_context = False
 
     def __init__(self, model, processor, device: str, dtype: torch.dtype, language: str, batch_size: int,
                  tokens_per_s: float, base_tokens: int, max_wps: float = 6.0,
@@ -129,14 +132,22 @@ class GuardedTranscriber:
         return [audio[int(a * self.sample_rate) : int(b * self.sample_rate)] for a, b in spans]
 
     @torch.inference_mode()
-    def _run(self, inputs, spans: list[tuple[float, float]], cfg: dict, prompt_len: int) -> tuple[torch.Tensor, LoopStoppingCriteria, list[bool]]:
+    def _run(self, inputs, spans: list[tuple[float, float]], cfg: dict, prompt_len: int,
+             **gen_kwargs) -> tuple[torch.Tensor, LoopStoppingCriteria, list[bool]]:
         """``generate`` with the loop guard; returns new tokens, the guard, and which rows hit the budget."""
         max_new = int(self.base_tokens + max(b - a for a, b in spans) * self.tokens_per_s)
         guard = LoopStoppingCriteria(prompt_len, self.processor.tokenizer, ignore_ids=self.ignore_ids)
-        out = self.model.generate(**inputs, max_new_tokens=max_new, stopping_criteria=StoppingCriteriaList([guard]), **cfg)
+        out = self.model.generate(**inputs, max_new_tokens=max_new, stopping_criteria=StoppingCriteriaList([guard]),
+                                  **gen_kwargs, **cfg)
         gen = out[:, prompt_len:]
-        # Budget is per batch (longest span); a row hit it if it never emitted EOS and was not stopped.
-        hit = [guard.reasons[r] is None and not any(t in self.eos_ids for t in gen[r].tolist()) for r in range(len(spans))]
+        # Budget is per batch (longest span). A row hit it if it was not stopped, never emitted EOS, and is
+        # actually that long: Whisper's generate strips the final EOS of the longest row (and its decoder
+        # prompt, hence the small margin), so a missing EOS alone proves nothing.
+        hit = [
+            guard.reasons[r] is None and gen.shape[1] >= max_new - 8
+            and not any(t in self.eos_ids for t in gen[r].tolist())
+            for r in range(len(spans))
+        ]
         return gen, guard, hit
 
     def _attempts(self, texts: list[str], spans, guard: LoopStoppingCriteria, hit: list[bool]) -> list[_Attempt]:
@@ -154,6 +165,7 @@ class CohereTranscriber(GuardedTranscriber):
 
     MODEL_ID = "CohereLabs/cohere-transcribe-03-2026"
     sample_rate = 16_000
+    max_input_s = 35.0  # longer inputs are re-chunked by the feature extractor
 
     def __init__(self, device: str = "cuda", dtype: torch.dtype = torch.bfloat16, model_id: str | None = None,
                  language: str = "fr", punctuation: bool = True, batch_size: int = 16, **kw):
@@ -182,6 +194,7 @@ class VibeVoiceTranscriber(GuardedTranscriber):
 
     MODEL_ID = "microsoft/VibeVoice-ASR-HF"
     sample_rate = 24_000
+    supports_context = True
 
     def __init__(self, device: str = "cuda", dtype: torch.dtype = torch.bfloat16, model_id: str | None = None,
                  language: str = "fr", context: str | None = None, batch_size: int = 1, **kw):
@@ -213,6 +226,36 @@ class VibeVoiceTranscriber(GuardedTranscriber):
         return " ".join(c for c in contents if c)
 
 
+class WhisperTranscriber(GuardedTranscriber):
+    """Whisper (default: bofenghuang/whisper-large-v3-french, large-v3 fine-tuned on French), 16 kHz, 30 s inputs,
+    optional text prompt (``prompt_ids``) to bias vocabulary."""
+
+    MODEL_ID = "bofenghuang/whisper-large-v3-french"
+    sample_rate = 16_000
+    max_input_s = 30.0
+    supports_context = True
+
+    def __init__(self, device: str = "cuda", dtype: torch.dtype = torch.bfloat16, model_id: str | None = None,
+                 language: str = "fr", context: str | None = None, batch_size: int = 16, **kw):
+        model_id = model_id or self.MODEL_ID
+        super().__init__(WhisperForConditionalGeneration.from_pretrained(model_id, dtype=dtype),
+                         AutoProcessor.from_pretrained(model_id), device, dtype, language, batch_size,
+                         tokens_per_s=12.0, base_tokens=24, **kw)
+        self.prompt_ids = (
+            self.processor.get_prompt_ids(context, return_tensors="pt").to(device) if context else None
+        )
+
+    def _generate_batch(self, audio, spans, cfg):
+        inputs = self.processor(self._slices(audio, spans), sampling_rate=self.sample_rate, return_tensors="pt",
+                                return_attention_mask=True).to(self.device, self.dtype)
+        extra = {"prompt_ids": self.prompt_ids} if self.prompt_ids is not None else {}
+        # The decoder prompt (<|startoftranscript|><|fr|>...) is a handful of distinct special tokens:
+        # scanning it with the loop guard is harmless, and its length varies with prompt_ids.
+        gen, guard, hit = self._run(inputs, spans, cfg, prompt_len=0, language=self.language, task="transcribe", **extra)
+        texts = [t.strip() for t in self.processor.tokenizer.batch_decode(gen, skip_special_tokens=True)]
+        return self._attempts(texts, spans, guard, hit)
+
+
 _CONTENT_RE = re.compile(r'"Content"\s*:\s*"((?:[^"\\]|\\.)*)"?')
 
 
@@ -227,4 +270,9 @@ def extract_contents(raw: str) -> list[str]:
     return out
 
 
-BACKENDS = {"cohere": CohereTranscriber, "vibevoice": VibeVoiceTranscriber}
+BACKENDS = {
+    "cohere": lambda **kw: CohereTranscriber(**kw),
+    "vibevoice": lambda **kw: VibeVoiceTranscriber(**kw),
+    "whisper-fr": lambda **kw: WhisperTranscriber(**kw),
+}
+CONTEXT_BACKENDS = {"vibevoice", "whisper-fr"}
