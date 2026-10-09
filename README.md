@@ -3,7 +3,7 @@
 Transcription diarisée, par lots :
 
 - **Qui parle quand** : [`nvidia/Nemotron-3-Diarization`](https://huggingface.co/nvidia/Nemotron-3-Diarization) (Sortformer, 8 locuteurs max)
-- **Ce qui est dit** : [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) (2B, 14 langues dont le français, Apache 2.0)
+- **Ce qui est dit** : [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) (2B, 14 langues dont le français, Apache 2.0) par défaut, ou [`microsoft/VibeVoice-ASR-HF`](https://huggingface.co/microsoft/VibeVoice-ASR-HF) (7B, accepte des mots-clés) avec `--asr vibevoice`
 - **Quand chaque mot est dit** : alignement forcé CTC avec [`jonatasgrosman/wav2vec2-large-xlsr-53-french`](https://huggingface.co/jonatasgrosman/wav2vec2-large-xlsr-53-french) (l'aligneur de WhisperX pour le français)
 - **Garde anti-boucle** : les décodeurs autorégressifs peuvent répéter la même phrase en boucle ; voir plus bas.
 
@@ -28,6 +28,7 @@ Cohere Transcribe est soumis à acceptation : acceptez les conditions sur la
 ```bash
 diarscribe reunion.m4a -v                        # français par défaut
 diarscribe *.wav --lang en -o transcripts/ --batch-size 32
+diarscribe reunion.m4a --asr vibevoice --context "boussard, craft ai, cabinet Liins, gestion de patrimoine"
 ```
 
 Sorties : `reunion.txt`, `reunion.srt`, `reunion.json` à côté du fichier (ou dans `-o DIR`).
@@ -45,6 +46,24 @@ Fonctionnement (mode `window`, par défaut) :
 4. Chaque mot prend le locuteur Nemotron actif à cet instant, puis un vote majoritaire par phrase (ponctuation de Cohere) corrige les mots de bord mal placés. Une bascule d'au moins 4 mots sans ponctuation est conservée.
 
 Le mode `--mode turns` (un appel par tour de parole) reste disponible : attribution stricte, mais beaucoup moins de contexte.
+
+### Choisir le moteur de transcription
+
+Les deux moteurs partagent tout le reste du pipeline : fenêtres, garde anti-boucle, alignement et attribution des locuteurs.
+Le JSON de VibeVoice (avec ses propres locuteurs et horodatages) est réduit à du texte.
+
+| | `--asr cohere` (défaut) | `--asr vibevoice` |
+|---|---|---|
+| Taille / RAM | 2B, ~4 Go | 7B, ~17 Go en bf16 |
+| Vitesse (5 min, M4 Pro) | 8 s | ~240 s |
+| Mots-clés (`--context`) | non | oui : corrige les noms propres de la liste |
+| Langue | imposée (`--lang`) | détectée automatiquement |
+| Texte courant | plus juste, sans « euh » | garde les hésitations, hallucine davantage |
+| Lots par défaut | 16 | 1 (24 Go de Mac) ; augmenter sur GPU à grande mémoire |
+
+Sur un extrait de réunion en français, `--context "craft ai, cabinet Liins, ..."` a fait passer VibeVoice
+de « Crafty Ray » et « Cabine Evans » à « Craft ai » et « cabinet Liins ». En revanche, les expressions courantes
+de la liste n'ont pas été mieux reconnues.
 
 - Dans une fenêtre, le modèle omet parfois une courte interjection prononcée par-dessus l'autre locuteur (« ok », « d'accord »).
 - `--lang` est obligatoire pour le modèle (pas de détection automatique ; `fr` par défaut). Il sert aussi à écarter les sorties dans une autre écriture.

@@ -149,3 +149,21 @@ def test_attach_punctuation_and_sentence_smoothing():
     # No punctuation between two speakers: both runs have >= 4 words, so the change is kept.
     run_on = [w(t, i * 0.3) for i, t in enumerate("alors on y va oui je suis prêt.".split())]
     assert smooth_by_sentence(run_on, [0, 0, 0, 0, 1, 1, 1, 1]) == [0, 0, 0, 0, 1, 1, 1, 1]
+
+
+def test_vibevoice_json_to_text():
+    import json
+
+    from diarscribe.asr import VibeVoiceTranscriber, extract_contents
+
+    class Proc:  # mimics VibeVoiceAsrProcessor.extract_speaker_dict (raises on truncated JSON)
+        def extract_speaker_dict(self, raw):
+            return json.loads(raw.removeprefix("assistant").strip())
+
+    vv = VibeVoiceTranscriber.__new__(VibeVoiceTranscriber)
+    vv.processor = Proc()
+    ok = 'assistant\n[{"Start":0,"End":2,"Speaker":0,"Content":"Bonjour."},{"Start":2,"End":3,"Speaker":1,"Content":"Salut !"}]'
+    assert vv._text(ok) == "Bonjour. Salut !"
+    cut = '[{"Start":0,"End":2,"Speaker":0,"Content":"Salut \\"toi\\""},{"Start":2,"End":4,"Speaker":1,"Content":"ça va'
+    assert vv._text(cut) == 'Salut "toi" ça va'
+    assert extract_contents(cut) == ['Salut "toi"', "ça va"]

@@ -1,7 +1,8 @@
 """Diarize → transcribe (batched, loop-guarded) → attribute text to speakers → segments.
 
 Two modes:
-  * ``window`` (default): Cohere transcribes continuous multi-speaker windows (up to 30 s of context),
+  * ``window`` (default): the ASR backend (Cohere Transcribe or VibeVoice-ASR) transcribes continuous
+    multi-speaker windows (up to 30 s of context),
     wav2vec2 aligns every word on the audio, and each word takes the Nemotron speaker active at that time.
   * ``turns``: one ASR call per Nemotron speaker turn. Strict attribution, but the median turn is ~1 s
     long, which leaves the model little context.
@@ -13,7 +14,7 @@ import logging
 import time
 
 from .align import Aligner, Word
-from .asr import SAMPLE_RATE, Piece, Transcriber
+from .asr import GuardedTranscriber, Piece
 from .audio import best_cut, load_audio
 from .chunking import Segment, Turn, build_windows, fmt_ts as _ts, merge_turns, relabel_speakers, speaker_at
 from .diarize import Diarizer
@@ -25,7 +26,7 @@ log = logging.getLogger(__name__)
 def run(
     path: str,
     diarizer: Diarizer,
-    transcriber: Transcriber,
+    transcriber: GuardedTranscriber,
     aligner: Aligner | None = None,
     mode: str = "window",
     max_chunk_s: float = 30.0,
@@ -34,10 +35,11 @@ def run(
     keep_tags: bool = False,
 ) -> list[Segment]:
     t0 = time.time()
-    if diarizer.sampling_rate != SAMPLE_RATE:
-        raise ValueError(f"diarisation à {diarizer.sampling_rate} Hz, ASR à {SAMPLE_RATE} Hz")
-    audio = load_audio(path, SAMPLE_RATE)
-    total = len(audio) / SAMPLE_RATE
+    sr = diarizer.sampling_rate  # diarization, alignment and silence cuts work at 16 kHz
+    if aligner is not None and aligner.sample_rate != sr:
+        raise ValueError(f"diarisation à {sr} Hz, alignement à {aligner.sample_rate} Hz")
+    audio = load_audio(path, sr)
+    total = len(audio) / sr
     log.info("Audio : %s (%s)", path, _ts(total))
 
     turns = diarizer(audio)
@@ -50,13 +52,16 @@ def run(
     if mode == "window":
         if aligner is None:
             raise ValueError("le mode window demande un aligneur")
-        spans = _split_long([(a, b, None) for a, b in build_windows(turns, max_chunk_s)], audio, max_chunk_s)
+        spans = _split_long([(a, b, None) for a, b in build_windows(turns, max_chunk_s)], audio, sr, max_chunk_s)
     else:
-        spans = _split_long([(t.start, t.end, t.speaker) for t in turns], audio, max_chunk_s)
+        spans = _split_long([(t.start, t.end, t.speaker) for t in turns], audio, sr, max_chunk_s)
     padded = [(max(0.0, a - pad_s), min(total, b + pad_s)) for a, b, _ in spans]
 
     t1 = time.time()
-    results = transcriber.transcribe(audio, padded)
+    # Times are in seconds, so the ASR can run on its own sample rate (VibeVoice: 24 kHz).
+    asr_audio = audio if transcriber.sample_rate == sr else load_audio(path, transcriber.sample_rate)
+    results = transcriber.transcribe(asr_audio, padded)
+    del asr_audio
     log.info("Transcription : %d %s en %.0fs", len(spans), "fenêtres" if mode == "window" else "tours", time.time() - t1)
 
     if mode == "window":
@@ -153,12 +158,12 @@ def _turn_segments(spans, results: list[list[Piece]], language: str, keep_tags: 
     return segments
 
 
-def _split_long(spans: list[tuple[float, float, int | None]], audio, max_len: float):
+def _split_long(spans: list[tuple[float, float, int | None]], audio, sr: int, max_len: float):
     """Split spans longer than ``max_len`` at the quietest point near each boundary."""
     out = []
     for start, end, spk in spans:
         while end - start > max_len:
-            cut = best_cut(audio, SAMPLE_RATE, start, end, target=start + max_len - 3.0, search=3.0)
+            cut = best_cut(audio, sr, start, end, target=start + max_len - 3.0, search=3.0)
             out.append((start, cut, spk))
             start = cut
         out.append((start, end, spk))
