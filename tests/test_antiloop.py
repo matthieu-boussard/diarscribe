@@ -103,3 +103,49 @@ def test_filters():
     assert clean("Merci.", lang="fr", duration=0.4)[1] == "short-turn hallucination"
     assert clean("Merci.", lang="fr", duration=2.5) == ("Merci.", None)
     assert clean("Merci, bonne soirée.", lang="fr", duration=0.8) == ("Merci, bonne soirée.", None)
+
+
+def test_ctc_align_recovers_token_positions():
+    import numpy as np
+
+    from diarscribe.align import ctc_align
+
+    # 12 frames, vocab {0: blank, 1: a, 2: b}; "a" peaks at frames 2-3, "b" at frame 8.
+    em = np.full((12, 3), -10.0)
+    em[:, 0] = -0.1
+    em[2:4, 1] = -0.01
+    em[2:4, 0] = -5.0
+    em[8, 2] = -0.01
+    em[8, 0] = -5.0
+    assert ctc_align(em, [1, 2], blank=0) == [(2, 3), (8, 8)]
+    assert ctc_align(em[:1], [1, 2], blank=0) is None  # more tokens than frames
+
+
+def test_speaker_at_and_windows():
+    from diarscribe.chunking import build_windows, speaker_at
+
+    turns = [Turn(0, 2, 0), Turn(2.3, 4, 1), Turn(10, 12, 1)]
+    assert build_windows(turns, max_len=30, max_gap=1.5) == [(0, 4), (10, 12)]
+    assert speaker_at(2.5, 2.8, turns) == 1
+    assert speaker_at(5.0, 5.2, turns) == 1  # no overlap: nearest turn (ends at 4.0)
+    assert speaker_at(1.9, 2.0, turns) == 0
+
+
+def test_attach_punctuation_and_sentence_smoothing():
+    from diarscribe.align import Word, _attach_punctuation
+    from diarscribe.pipeline import smooth_by_sentence
+
+    assert _attach_punctuation(["non", "?", "Oui", "–", "bien", "!"]) == ["non ?", "Oui –", "bien !"]
+
+    def w(t, a):
+        return Word(a, a + 0.3, t)
+
+    words = [w("Est-ce", 0), w("que", .3), w("vous", .6), w("avez", .9), w("des", 1.2), w("questions?", 1.5),
+             w("Non,", 2.0), w("c'est", 2.3), w("clair.", 2.6)]
+    raw = [0, 0, 0, 0, 0, 1, 1, 1, 1]  # edge word "questions?" leaked to speaker 1
+    assert smooth_by_sentence(words, raw) == [0, 0, 0, 0, 0, 0, 1, 1, 1]
+    words[5] = Word(1.5, 3.0, "questions?")  # stretched by the aligner: still one word, still relabelled
+    assert smooth_by_sentence(words, raw)[5] == 0
+    # No punctuation between two speakers: both runs have >= 4 words, so the change is kept.
+    run_on = [w(t, i * 0.3) for i, t in enumerate("alors on y va oui je suis prêt.".split())]
+    assert smooth_by_sentence(run_on, [0, 0, 0, 0, 1, 1, 1, 1]) == [0, 0, 0, 0, 1, 1, 1, 1]

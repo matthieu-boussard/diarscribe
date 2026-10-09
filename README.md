@@ -4,12 +4,13 @@ Transcription diarisée, par lots :
 
 - **Qui parle quand** : [`nvidia/Nemotron-3-Diarization`](https://huggingface.co/nvidia/Nemotron-3-Diarization) (Sortformer, 8 locuteurs max)
 - **Ce qui est dit** : [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) (2B, 14 langues dont le français, Apache 2.0)
+- **Quand chaque mot est dit** : alignement forcé CTC avec [`jonatasgrosman/wav2vec2-large-xlsr-53-french`](https://huggingface.co/jonatasgrosman/wav2vec2-large-xlsr-53-french) (l'aligneur de WhisperX pour le français)
 - **Garde anti-boucle** : les décodeurs autorégressifs peuvent répéter la même phrase en boucle ; voir plus bas.
 
 Fonctionne sur GPU NVIDIA (`cuda`), Apple Silicon (`mps`) ou CPU.
 
-Mesuré sur un MacBook M4 Pro (24 Go), réunion de 45 min en français : **51 s** au total
-(diarisation 9 s, transcription de 998 tours 42 s), ~1,8 Go de RAM.
+Mesuré sur un MacBook M4 Pro (24 Go), réunion de 45 min en français : **82 s** au total
+(diarisation 9 s, transcription de 188 fenêtres 44 s, alignement 30 s), ~2,3 Go de RAM.
 
 ## Installation
 
@@ -36,13 +37,18 @@ Sorties : `reunion.txt`, `reunion.srt`, `reunion.json` à côté du fichier (ou 
 [00:00:07.40 - 00:00:09.05] SPEAKER_1: Oui, allons-y.
 ```
 
-Fonctionnement : Nemotron découpe l'audio en tours de parole. Les tours d'un même locuteur séparés de
-moins de 0,6 s sont fusionnés, et les tours de plus de 30 s sont coupés au point le plus silencieux.
-Cohere Transcribe transcrit ensuite les tours **par lots** (`--batch-size`).
-Comme le modèle ne produit ni horodatage ni locuteur, chaque texte hérite du locuteur de son tour.
+Fonctionnement (mode `window`, par défaut) :
 
+1. Nemotron trouve qui parle quand.
+2. Les tours sont regroupés en **fenêtres de parole continues** (≤ 30 s, coupées sur les silences > 1,5 s), et Cohere Transcribe les transcrit **par lots**. Le modèle voit des phrases entières, plus des fragments de ~1 s : c'est le principal gain de qualité.
+3. wav2vec2 aligne chaque mot sur l'audio (Viterbi CTC, `align.py`).
+4. Chaque mot prend le locuteur Nemotron actif à cet instant, puis un vote majoritaire par phrase (ponctuation de Cohere) corrige les mots de bord mal placés. Une bascule d'au moins 4 mots sans ponctuation est conservée.
+
+Le mode `--mode turns` (un appel par tour de parole) reste disponible : attribution stricte, mais beaucoup moins de contexte.
+
+- Dans une fenêtre, le modèle omet parfois une courte interjection prononcée par-dessus l'autre locuteur (« ok », « d'accord »).
 - `--lang` est obligatoire pour le modèle (pas de détection automatique ; `fr` par défaut). Il sert aussi à écarter les sorties dans une autre écriture.
-- La parole superposée (deux locuteurs en même temps) est transcrite dans le tour de chacun.
+- En mode `turns`, la parole superposée est transcrite dans le tour de chacun.
 - Diarisation des fichiers > 10 min : streaming par morceaux d'environ 27 s (au lieu des 0,72 s du mode « low_latency »), soit 18× plus rapide et plus proche du résultat offline.
 - Les tours de moins de 0,15 s sont ignorés. Un « Merci. » isolé sur un tour de moins d'une seconde est écarté : le décodeur en invente sur les clics et les respirations.
 - Les balises `[Silence]`, `[Noise]`… et les phrases-pièges connues (« Sous-titres réalisés par… ») sont retirées (`--keep-tags` pour garder les balises).
@@ -67,4 +73,4 @@ Réglages : `--max-wps` (seuil de débit), `--max-chunk`, `--batch-size`. Les se
 pytest -q
 ```
 
-Les tests couvrent la détection de boucles (y compris par ligne dans un lot), le filtrage et le découpage, sans télécharger les modèles.
+Les tests couvrent la détection de boucles (y compris par ligne dans un lot), l'alignement CTC, l'attribution par phrase, le filtrage et le découpage, sans télécharger les modèles.

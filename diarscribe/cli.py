@@ -14,6 +14,7 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 import torch  # noqa: E402
 
 from . import output, pipeline  # noqa: E402
+from .align import Aligner  # noqa: E402
 from .asr import Transcriber  # noqa: E402
 from .diarize import Diarizer  # noqa: E402
 
@@ -34,6 +35,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-f", "--formats", default="txt,srt,json", help="formats de sortie parmi txt,srt,json")
     ap.add_argument("-l", "--lang", choices=LANGUAGES, default="fr",
                     help="langue de l'audio (Cohere Transcribe ne la détecte pas) ; écarte aussi les sorties dans une autre écriture")
+    ap.add_argument("--mode", choices=["window", "turns"], default="window",
+                    help="window : fenêtres continues ≤ 30 s, mots alignés puis attribués au locuteur (plus de contexte) ; "
+                         "turns : un appel par tour de parole")
+    ap.add_argument("--align-model", help="modèle CTC wav2vec2 pour l'alignement des mots (défaut selon --lang)")
     ap.add_argument("--no-punctuation", action="store_true", help="transcription sans ponctuation ni majuscules")
     ap.add_argument("--keep-tags", action="store_true", help="garder les balises [Silence], [Noise]...")
     ap.add_argument("--batch-size", type=int, default=16, help="tours de parole transcrits par appel au modèle")
@@ -63,10 +68,15 @@ def main(argv: list[str] | None = None) -> int:
         device=args.device, dtype=DTYPES[args.dtype], language=args.lang, punctuation=not args.no_punctuation,
         batch_size=args.batch_size, max_wps=args.max_wps,
     )
+    aligner = None
+    if args.mode == "window":
+        print("Chargement de l'aligneur wav2vec2...", file=sys.stderr)
+        aligner = Aligner(language=args.lang, device=args.device, model_id=args.align_model)
 
     for audio in args.audio:
         src = Path(audio)
-        segments = pipeline.run(str(src), diarizer, transcriber, max_chunk_s=args.max_chunk, keep_tags=args.keep_tags)
+        segments = pipeline.run(str(src), diarizer, transcriber, aligner, mode=args.mode,
+                                max_chunk_s=args.max_chunk, keep_tags=args.keep_tags)
         out_dir = args.output_dir or src.parent
         out_dir.mkdir(parents=True, exist_ok=True)
         for p in output.write_all(segments, out_dir / src.stem, formats):
