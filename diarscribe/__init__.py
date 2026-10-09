@@ -1,1 +1,1 @@
-"""Diarized speech-to-text for macOS: Nemotron-3-Diarization + VibeVoice-ASR."""
+"""Diarized speech-to-text: Nemotron-3-Diarization + Cohere Transcribe."""

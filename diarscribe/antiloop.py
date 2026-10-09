@@ -1,16 +1,15 @@
-"""Loop / hallucination guards for VibeVoice-ASR.
+"""Loop / hallucination guards for autoregressive ASR decoding.
 
 Three layers:
-  1. ``LoopStoppingCriteria`` aborts ``generate`` as soon as the output becomes periodic
-     (exact token loop, or the same text repeated with only the timestamps changing).
+  1. ``LoopStoppingCriteria`` stops each row of a batched ``generate`` as soon as its output becomes
+     periodic (exact token loop, or the same words repeated with different tokenization).
   2. ``diagnose`` inspects a finished transcription (compression ratio, words/second,
-     repeated n-grams, incoherent timestamps, token budget exhausted).
+     repeated n-grams, token budget exhausted).
   3. ``collapse_repetitions`` is the last-resort cleanup when every retry still loops.
 """
 
 from __future__ import annotations
 
-import json
 import re
 import unicodedata
 import zlib
@@ -21,7 +20,6 @@ import torch
 from transformers import StoppingCriteria
 
 _WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
-_CONTENT_RE = re.compile(r'"Content"\s*:\s*"((?:[^"\\]|\\.)*)"?')
 
 
 def find_periodic_suffix(
@@ -70,7 +68,7 @@ def find_repeated_run(
 
 
 def normalize_words(text: str) -> list[str]:
-    """Lower-cased letter-only words: digits (timestamps) and punctuation (JSON) vanish."""
+    """Lower-cased letter-only words: digits and punctuation vanish."""
     text = unicodedata.normalize("NFKC", text).lower()
     return _WORD_RE.findall(text)
 
@@ -80,48 +78,47 @@ def compression_ratio(text: str) -> float:
     return len(data) / max(1, len(zlib.compress(data)))
 
 
-def extract_contents(raw: str) -> list[str]:
-    """Best-effort extraction of "Content" fields from (possibly truncated) VibeVoice JSON."""
-    out = []
-    for m in _CONTENT_RE.finditer(raw):
-        try:
-            out.append(json.loads(f'"{m.group(1)}"'))
-        except json.JSONDecodeError:
-            out.append(m.group(1))
-    return out
-
-
 class LoopStoppingCriteria(StoppingCriteria):
-    """Stops generation (and records why) when the output starts looping."""
+    """Per-row loop detector for batched ``generate``; ``reasons[row]`` records why a row was stopped."""
 
-    def __init__(self, prompt_len: int, tokenizer: Any, tail_tokens: int = 400, text_check_every: int = 8):
+    def __init__(self, prompt_len: int, tokenizer: Any, ignore_ids: set[int] = frozenset(),
+                 tail_tokens: int = 400, text_check_every: int = 8):
         self.prompt_len = prompt_len
         self.tokenizer = tokenizer
+        self.ignore_ids = ignore_ids
         self.tail_tokens = tail_tokens
         self.text_check_every = text_check_every
-        self.reason: str | None = None
+        self.reasons: list[str | None] = []
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> torch.BoolTensor:
-        gen = input_ids[0, self.prompt_len :]
-        n = gen.shape[0]
-        if self.reason is None and n >= 16:
-            tail = gen[-self.tail_tokens :].tolist()
-            hit = find_periodic_suffix(tail)
+        if not self.reasons:
+            self.reasons = [None] * input_ids.shape[0]
+        gen = input_ids[:, self.prompt_len :]
+        n = gen.shape[1]
+        if n >= 16:
+            tails = gen[:, -self.tail_tokens :].tolist()
+            for row, tail in enumerate(tails):
+                # Finished rows are padded with EOS/pad: that repetition is not a loop.
+                if self.reasons[row] is None and tail[-1] not in self.ignore_ids:
+                    self.reasons[row] = self._check(tail, n)
+        return torch.tensor([r is not None for r in self.reasons], dtype=torch.bool, device=input_ids.device)
+
+    def _check(self, tail: list[int], n: int) -> str | None:
+        hit = find_periodic_suffix(tail)
+        if hit:
+            return f"token loop (period={hit[0]}, x{hit[1]})"
+        if n % self.text_check_every == 0:
+            # Same words with a different tokenization each time are not token-exact loops.
+            words = normalize_words(self.tokenizer.decode(tail, skip_special_tokens=True))
+            hit = find_periodic_suffix(words, max_period=40, min_repeats=3, min_span=30, short_period=3, short_min_repeats=6)
             if hit:
-                self.reason = f"token loop (period={hit[0]}, x{hit[1]})"
-            elif n % self.text_check_every == 0:
-                # Catches "same sentence, new timestamps" loops that are not token-exact.
-                words = normalize_words(self.tokenizer.decode(tail, skip_special_tokens=True))
-                hit = find_periodic_suffix(words, max_period=40, min_repeats=3, min_span=30, short_period=3, short_min_repeats=6)
-                if hit:
-                    self.reason = f"text loop (period={hit[0]} words, x{hit[1]})"
-        return torch.full((input_ids.shape[0],), self.reason is not None, dtype=torch.bool, device=input_ids.device)
+                return f"text loop (period={hit[0]} words, x{hit[1]})"
+        return None
 
 
 def diagnose(
     text: str,
     duration: float,
-    segments: list[dict] | None = None,
     hit_token_limit: bool = False,
     stop_reason: str | None = None,
     max_wps: float = 6.0,
@@ -144,18 +141,6 @@ def diagnose(
     if run:
         issues.append(f"repeated {run[1]}-gram x{run[2]}")
 
-    if segments:
-        prev_start = -1.0
-        for seg in segments:
-            start, end = _num(seg.get("Start")), _num(seg.get("End"))
-            if end is not None and end > duration + 3.0:
-                issues.append("timestamps beyond audio")
-                break
-            if start is not None:
-                if start < prev_start - 1.0:
-                    issues.append("timestamps going backwards")
-                    break
-                prev_start = start
     return issues
 
 
@@ -180,9 +165,3 @@ def collapse_repetitions(text: str, max_n: int = 30) -> str:
             i += 1
     return " ".join(out)
 
-
-def _num(x) -> float | None:
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return None

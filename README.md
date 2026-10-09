@@ -1,28 +1,32 @@
 # diarscribe
 
-Transcription diarisée pour Mac (Apple Silicon) :
+Transcription diarisée, par lots :
 
 - **Qui parle quand** : [`nvidia/Nemotron-3-Diarization`](https://huggingface.co/nvidia/Nemotron-3-Diarization) (Sortformer, 8 locuteurs max)
-- **Ce qui est dit** : [`microsoft/VibeVoice-ASR-HF`](https://huggingface.co/microsoft/VibeVoice-ASR-HF) (multilingue, mots-clés de contexte)
-- **Garde anti-boucle** : VibeVoice a tendance à répéter la même phrase en boucle ; voir plus bas.
+- **Ce qui est dit** : [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) (2B, 14 langues dont le français, Apache 2.0)
+- **Garde anti-boucle** : les décodeurs autorégressifs peuvent répéter la même phrase en boucle ; voir plus bas.
+
+Fonctionne sur GPU NVIDIA (`cuda`), Apple Silicon (`mps`) ou CPU.
+
+Mesuré sur un MacBook M4 Pro (24 Go), réunion de 45 min en français : **51 s** au total
+(diarisation 9 s, transcription de 998 tours 42 s), ~1,8 Go de RAM.
 
 ## Installation
 
 ```bash
-brew install ffmpeg
+# macOS : brew install ffmpeg — Linux : apt install ffmpeg
 uv venv --python 3.12 && uv pip install -e ".[dev]"
+hf auth login
 ```
 
-`hf auth login` peut être nécessaire pour télécharger Nemotron (modèle à licence OpenMDW).
-
-Mémoire : VibeVoice-ASR pèse ~17 Go en bf16. Sur un Mac de 24 Go, fermez les applis lourdes.
-Nemotron est petit et bascule tout seul sur CPU si MPS échoue.
+Cohere Transcribe est soumis à acceptation : acceptez les conditions sur la
+[page du modèle](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) avec le compte utilisé par `hf auth login`.
 
 ## Utilisation
 
 ```bash
-diarscribe reunion.m4a --lang fr -v
-diarscribe interview.mp3 --lang fr -c "Craft AI, Matthieu, diarisation" -f txt,srt
+diarscribe reunion.m4a -v                        # français par défaut
+diarscribe *.wav --lang en -o transcripts/ --batch-size 32
 ```
 
 Sorties : `reunion.txt`, `reunion.srt`, `reunion.json` à côté du fichier (ou dans `-o DIR`).
@@ -32,27 +36,30 @@ Sorties : `reunion.txt`, `reunion.srt`, `reunion.json` à côté du fichier (ou 
 [00:00:07.40 - 00:00:09.05] SPEAKER_1: Oui, allons-y.
 ```
 
-Modes :
-- `window` (défaut) : fenêtres de parole ≤ `--max-chunk` s (30 par défaut). Chaque phrase de VibeVoice est attribuée au locuteur Nemotron qui la recouvre le plus. Le contexte long améliore nettement la reconnaissance. Limite : une réponse très courte de l'autre locuteur (« Exactement. ») peut rester collée à la phrase voisine.
-- `turns` : un appel par tour de parole Nemotron. L'attribution est stricte, mais les tours de moins d'une seconde font halluciner le modèle (chinois, « Make sure to subscribe »…).
+Fonctionnement : Nemotron découpe l'audio en tours de parole. Les tours d'un même locuteur séparés de
+moins de 0,6 s sont fusionnés, et les tours de plus de 30 s sont coupés au point le plus silencieux.
+Cohere Transcribe transcrit ensuite les tours **par lots** (`--batch-size`).
+Comme le modèle ne produit ni horodatage ni locuteur, chaque texte hérite du locuteur de son tour.
 
-`--lang fr` écarte les sorties dans une autre écriture (chinois, cyrillique…). Les balises `[Silence]`, `[Noise]` et `[Unintelligible Speech]`, ainsi que les phrases-pièges connues, sont retirées par défaut (`--keep-tags` pour garder les balises).
-
-Mesuré sur un M4 Pro (24 Go), réunion en français : ~1,2× la durée de l'audio, ~18 Go de RAM.
+- `--lang` est obligatoire pour le modèle (pas de détection automatique ; `fr` par défaut). Il sert aussi à écarter les sorties dans une autre écriture.
+- La parole superposée (deux locuteurs en même temps) est transcrite dans le tour de chacun.
+- Diarisation des fichiers > 10 min : streaming par morceaux d'environ 27 s (au lieu des 0,72 s du mode « low_latency »), soit 18× plus rapide et plus proche du résultat offline.
+- Les tours de moins de 0,15 s sont ignorés. Un « Merci. » isolé sur un tour de moins d'une seconde est écarté : le décodeur en invente sur les clics et les respirations.
+- Les balises `[Silence]`, `[Noise]`… et les phrases-pièges connues (« Sous-titres réalisés par… ») sont retirées (`--keep-tags` pour garder les balises).
 
 ## Comment les boucles sont empêchées
 
 | Couche | Où | Ce qu'elle fait |
 |---|---|---|
-| 1. Découpage | `chunking.py`, `pipeline.py` | VibeVoice ne reçoit que de la parole (jamais de longs silences, déclencheurs classiques), en segments ≤ 30 s coupés au point le plus silencieux. |
-| 2. Budget de tokens | `asr.py` | `max_new_tokens = 80 + 15 × durée` : une boucle ne peut pas courir indéfiniment. |
-| 3. Arrêt en direct | `antiloop.LoopStoppingCriteria` | À chaque token, détecte une suite périodique : boucle exacte de tokens, ou même texte répété avec seulement les timestamps qui changent. `generate` s'arrête aussitôt. |
-| 4. Diagnostic | `antiloop.diagnose` | Taux de compression zlib > 2,4, plus de 6 mots/s, n-gramme répété, timestamps hors audio ou qui reculent, budget épuisé. |
-| 5. Relances | `asr.RETRY_LADDER` | Greedy → `repetition_penalty=1.1` → échantillonnage `T=0.3`. Pas de `no_repeat_ngram_size`, qui casserait le JSON produit par VibeVoice. |
-| 6. Découpe récursive | `Transcriber.transcribe_span` | Si les 3 essais bouclent, le segment est coupé en deux au point le plus calme (2 niveaux max). |
+| 1. Découpage | `chunking.py`, `pipeline.py` | Le modèle ne reçoit que de la parole (jamais de longs silences, déclencheurs classiques), en tours ≤ 30 s. |
+| 2. Budget de tokens | `asr.py` | `max_new_tokens = 24 + 12 × durée` : une boucle ne peut pas courir indéfiniment. |
+| 3. Arrêt en direct | `antiloop.LoopStoppingCriteria` | Pour chaque ligne du lot, détecte une suite périodique (boucle exacte de tokens, ou mêmes mots répétés). Seule la ligne qui boucle s'arrête. |
+| 4. Diagnostic | `antiloop.diagnose` | Taux de compression zlib > 2,4, débit de mots invraisemblable, n-gramme répété, budget épuisé. |
+| 5. Relances | `asr.RETRY_LADDER` | Greedy → `repetition_penalty=1.1` → échantillonnage `T=0.3`. Seuls les tours suspects sont relancés, ensemble, par lots. Pas de `no_repeat_ngram_size`, qui interdirait les vraies répétitions orales (« non non non »). |
+| 6. Découpe récursive | `Transcriber.transcribe` | Si les 3 essais bouclent, le tour est coupé en deux au point le plus calme (2 niveaux max). |
 | 7. Nettoyage | `antiloop.collapse_repetitions` | En dernier recours, les répétitions sont supprimées, le texte est plafonné et le segment est marqué `⚠` / `loop_trimmed`. |
 
-Réglages : `--max-wps` (seuil de débit), `--max-chunk`. Les seuils de détection sont dans `antiloop.py`.
+Réglages : `--max-wps` (seuil de débit), `--max-chunk`, `--batch-size`. Les seuils de détection sont dans `antiloop.py`.
 
 ## Tests
 
@@ -60,4 +67,4 @@ Réglages : `--max-wps` (seuil de débit), `--max-chunk`. Les seuils de détecti
 pytest -q
 ```
 
-Les tests couvrent la détection de boucles et le découpage, sans télécharger les modèles.
+Les tests couvrent la détection de boucles (y compris par ligne dans un lot), le filtrage et le découpage, sans télécharger les modèles.
