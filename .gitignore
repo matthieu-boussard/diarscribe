@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+# never commit audio or transcripts
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.srt
+*.txt
+*.json
+!pyproject.toml

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "diarscribe"
+version = "0.1.0"
+description = "Speech-to-text diarisé pour Mac : Nemotron-3-Diarization + VibeVoice-ASR, avec garde anti-boucle"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.6",
+    "accelerate>=1.0",
+    "numpy>=1.26",
+    "librosa>=0.10",  # Nemotron feature extractor
+    # First releases shipping both nemotron3_diarization and vibevoice_asr.
+    "transformers>=5.19",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+diarscribe = "diarscribe.cli:main"
