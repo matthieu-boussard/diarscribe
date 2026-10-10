@@ -29,6 +29,7 @@ Cohere Transcribe est soumis à acceptation : acceptez les conditions sur la
 diarscribe reunion.m4a -v                        # français par défaut
 diarscribe *.wav --lang en -o transcripts/ --batch-size 32
 diarscribe reunion.m4a --asr vibevoice --context "boussard, craft ai, cabinet Liins, gestion de patrimoine"
+diarscribe reunion.m4a -g "Boussard, Craft AI, Craft, cabinet Liins" --style lu --numbers digits
 ```
 
 Sorties : `reunion.txt`, `reunion.srt`, `reunion.json` à côté du fichier (ou dans `-o DIR`).
@@ -97,6 +98,31 @@ Hojo ↔ Cohere 33 %, Hojo ↔ Whisper 34 %, Hojo ↔ VibeVoice 35 %, et Granite
 - Diarisation des fichiers > 10 min : streaming par morceaux d'environ 27 s (au lieu des 0,72 s du mode « low_latency »), soit 18× plus rapide et plus proche du résultat offline.
 - Les tours de moins de 0,15 s sont ignorés. Un « Merci. » isolé sur un tour de moins d'une seconde est écarté : le décodeur en invente sur les clics et les respirations.
 - Les balises `[Silence]`, `[Noise]`… et les phrases-pièges connues (« Sous-titres réalisés par… ») sont retirées (`--keep-tags` pour garder les balises).
+
+## Post-traitement du texte (`postprocess.py`)
+
+Il s'applique aux segments finaux, quel que soit le moteur, et prend environ 0,3 s par heure d'audio.
+
+| Étape | Option | Par défaut | Ce qu'elle fait |
+|---|---|---|---|
+| Filtre de langue | `--no-lang-filter` | activé | Écarte un segment (≥ 3 mots, URL ignorées) qu'un détecteur ([lingua](https://github.com/pemistahl/lingua-py)) attribue à une autre langue avec confiance (≥ 0,6, et ≤ 0,05 pour la langue attendue) : hallucinations sur fenêtres courtes. Les phrases mixtes (« Clear Seed Data, je sais pas où ») sont gardées. |
+| Glossaire | `-g "cabinet Liins, Craft"` | termes de `--context` | Rétablit l'orthographe des noms propres. Une variante connue s'indique explicitement (`"Craft AI=crafty ray"`) ; sinon, correspondance phonétique stricte : même nombre de mots, chaque mot différent doit sonner pareil et ne jamais être un mot courant (fréquence [wordfreq](https://github.com/rspeer/wordfreq) Zipf < 4). |
+| Style | `--style lu` | `verbatim` | `lu` retire les hésitations (euh, hum) et les bégaiements (« je je », « on va on va »), mais garde l'insistance (« non, non »), les pronoms réfléchis (« nous nous ») et la mise en relief (« elle, elle est », « pour ça, ça coûte »). |
+| Nombres | `--numbers digits` | `keep` | « dix ans » → « 10 ans », « zéro six… » → « 06… » ([text2num](https://github.com/allo-media/text2num)). |
+| Typographie | `--no-typography` | activée | Apostrophe ’, espaces insécables avant `; : ! ?` et dans « », points de suspension, 1re / 2e, majuscule après un point. |
+
+Évaluation sur 6 réunions (4 h 34, transcriptions déjà produites par Cohere, Whisper FR et VibeVoice) :
+
+| | Cohere | Whisper FR | VibeVoice |
+|---|---|---|---|
+| Segments écartés (langue) | 0 / 3 655 | 0 / 3 396 | 17 / 3 392 |
+| Corrections du glossaire (`Boussard, Craft AI, Craft, cabinet Liins`) | 6 | 12 | 5 |
+| Hésitations / bégaiements retirés (`--style lu`) | 102 / 45 | 85 / 253 | 1 307 / 499 |
+| Nombres convertis (`--numbers digits`) | 82 | 15 | 726 |
+
+- **Filtre de langue** : les 17 segments écartés chez VibeVoice sont des phrases anglaises ou chinoises inventées. Recoupés avec Cohere et Whisper aux mêmes instants, ce sont du français dans les 10 cas vérifiés. Il n'y a eu aucun faux positif sur les autres moteurs, après qu'une URL dans une phrase française en a provoqué un, corrigé depuis.
+- **Glossaire** : ses premières versions remplaçaient des mots courants (« bizarre » → « Boussard », « un cabinet en gestion » → « cabinet Liins ») et ajoutaient des mots (« Kraft » → « Craft AI »). D'où les règles strictes : il n'y a plus de faux positif connu, au prix de moins de corrections. Il faut ajouter au glossaire la forme courte réellement prononcée (« Craft ») : c'est elle qui corrige la plupart des « Kraft ».
+- **Écart entre modèles** (distance d'édition en mots, moyenne des 6 fichiers) : Cohere ↔ Whisper passe de 21,3 % à 20,3 % et Cohere ↔ VibeVoice de 28,2 % à 25,4 % avec `--style lu --numbers digits`. Une partie des désaccords ne venait que du style (hésitations gardées ou non, « dix » contre « 10 »).
 
 ## Comment les boucles sont empêchées
 

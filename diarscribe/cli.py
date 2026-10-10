@@ -17,6 +17,7 @@ from . import output, pipeline  # noqa: E402
 from .align import Aligner  # noqa: E402
 from .asr import BACKENDS, CONTEXT_BACKENDS  # noqa: E402
 from .diarize import Diarizer  # noqa: E402
+from .postprocess import PostConfig, postprocess, summary  # noqa: E402
 
 DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 LANGUAGES = ["ar", "de", "el", "en", "es", "fr", "it", "ja", "ko", "nl", "pl", "pt", "vi", "zh"]
@@ -39,6 +40,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-l", "--lang", choices=LANGUAGES, default="fr",
                     help="langue de l'audio (imposée à Cohere ; choix de l'aligneur) ; écarte aussi les sorties dans une autre écriture")
     ap.add_argument("-c", "--context", help="mots-clés / contexte (noms propres, jargon...) ; pas avec cohere")
+    post = ap.add_argument_group("post-traitement du texte")
+    post.add_argument("-g", "--glossary",
+                      help="noms propres, séparés par des virgules ; variantes connues avec = : "
+                           "\"cabinet Liins, Craft AI=crafty ray|clarge tri\" (défaut : termes de --context)")
+    post.add_argument("--style", choices=["verbatim", "lu"], default="verbatim",
+                      help="verbatim : tel que dit ; lu : sans hésitations (euh, hum) ni bégaiements (je je)")
+    post.add_argument("--numbers", choices=["keep", "digits"], default="keep", help="digits : « dix ans » -> « 10 ans »")
+    post.add_argument("--no-typography", action="store_true", help="ne pas appliquer la typographie française")
+    post.add_argument("--no-lang-filter", action="store_true",
+                      help="garder les segments détectés dans une autre langue (hallucinations sur fenêtres courtes)")
     ap.add_argument("--mode", choices=["window", "turns"], default="window",
                     help="window : fenêtres continues ≤ 30 s, mots alignés puis attribués au locuteur (plus de contexte) ; "
                          "turns : un appel par tour de parole")
@@ -84,10 +95,18 @@ def main(argv: list[str] | None = None) -> int:
         print("Chargement de l'aligneur wav2vec2...", file=sys.stderr)
         aligner = Aligner(language=args.lang, device=args.device, model_id=args.align_model)
 
+    glossary = args.glossary if args.glossary is not None else args.context
+    post_cfg = PostConfig(
+        lang=args.lang, lang_filter=not args.no_lang_filter, style=args.style, numbers=args.numbers,
+        typography=not args.no_typography, glossary=[t for t in (glossary or "").split(",") if t.strip()],
+    )
+
     for audio in args.audio:
         src = Path(audio)
         segments = pipeline.run(str(src), diarizer, transcriber, aligner, mode=args.mode,
                                 max_chunk_s=args.max_chunk, keep_tags=args.keep_tags)
+        segments, stats = postprocess(segments, post_cfg)
+        logging.getLogger("diarscribe").info(summary(stats))
         out_dir = args.output_dir or src.parent
         out_dir.mkdir(parents=True, exist_ok=True)
         for p in output.write_all(segments, out_dir / src.stem, formats):
