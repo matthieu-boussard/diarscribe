@@ -17,6 +17,7 @@ from . import output, pipeline  # noqa: E402
 from .align import Aligner  # noqa: E402
 from .asr import BACKENDS, CONTEXT_BACKENDS  # noqa: E402
 from .diarize import Diarizer  # noqa: E402
+from .fusion import FusedTranscriber  # noqa: E402
 from .postprocess import PostConfig, postprocess, summary  # noqa: E402
 
 DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
@@ -34,9 +35,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("audio", nargs="+", help="fichier(s) audio/vidéo (tout format lu par ffmpeg)")
     ap.add_argument("-o", "--output-dir", type=Path, help="dossier de sortie (défaut : à côté de l'audio)")
     ap.add_argument("-f", "--formats", default="txt,srt,json", help="formats de sortie parmi txt,srt,json")
-    ap.add_argument("--asr", choices=list(BACKENDS), default="cohere",
-                    help="cohere (2B, défaut) ; vibevoice (7B) ; whisper-fr (large-v3 affiné en français). "
-                         "vibevoice et whisper-fr acceptent --context")
+    ap.add_argument("--asr", choices=[*BACKENDS, "fusion"], default="cohere",
+                    help="cohere (2B, défaut) ; vibevoice (7B) ; whisper-fr (large-v3 affiné en français) ; "
+                         "fusion (cohere + whisper-fr, désaccords tranchés par l'aligneur). "
+                         "vibevoice, whisper-fr et fusion acceptent --context")
     ap.add_argument("-l", "--lang", choices=LANGUAGES, default="fr",
                     help="langue de l'audio (imposée à Cohere ; choix de l'aligneur) ; écarte aussi les sorties dans une autre écriture")
     ap.add_argument("-c", "--context", help="mots-clés / contexte (noms propres, jargon...) ; pas avec cohere")
@@ -76,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(f"format(s) inconnu(s) : {', '.join(sorted(unknown))}")
     if not 0 < args.max_chunk <= 35:
         ap.error("--max-chunk doit être dans ]0, 35] (au-delà, Cohere redécoupe lui-même l'audio)")
-    if args.context and args.asr not in CONTEXT_BACKENDS:
+    if args.context and args.asr not in CONTEXT_BACKENDS | {"fusion"}:
         ap.error(f"--context n'est pas pris en charge par --asr {args.asr}")
 
     print("Chargement de Nemotron-3-Diarization...", file=sys.stderr)
@@ -84,16 +86,26 @@ def main(argv: list[str] | None = None) -> int:
     common = dict(device=args.device, dtype=DTYPES[args.dtype], language=args.lang, max_wps=args.max_wps)
     if args.batch_size:
         common["batch_size"] = args.batch_size
-    if args.asr in CONTEXT_BACKENDS:
-        common["context"] = args.context
-    if args.asr == "cohere":
-        common["punctuation"] = not args.no_punctuation
-    print(f"Chargement du modèle de transcription ({args.asr})...", file=sys.stderr)
-    transcriber = BACKENDS[args.asr](**common)
     aligner = None
-    if args.mode == "window":
+    if args.mode == "window" or args.asr == "fusion":
         print("Chargement de l'aligneur wav2vec2...", file=sys.stderr)
         aligner = Aligner(language=args.lang, device=args.device, model_id=args.align_model)
+
+    def load(asr: str):
+        kw = dict(common)
+        if asr in CONTEXT_BACKENDS:
+            kw["context"] = args.context
+        if asr == "cohere":
+            kw["punctuation"] = not args.no_punctuation
+        print(f"Chargement du modèle de transcription ({asr})...", file=sys.stderr)
+        return BACKENDS[asr](**kw)
+
+    if args.asr == "fusion":
+        transcriber = FusedTranscriber(load("cohere"), load("whisper-fr"), aligner)
+    else:
+        transcriber = load(args.asr)
+    if args.mode == "turns":
+        aligner = None  # only used for fusion scoring
 
     glossary = args.glossary if args.glossary is not None else args.context
     post_cfg = PostConfig(
@@ -105,6 +117,9 @@ def main(argv: list[str] | None = None) -> int:
         src = Path(audio)
         segments = pipeline.run(str(src), diarizer, transcriber, aligner, mode=args.mode,
                                 max_chunk_s=args.max_chunk, keep_tags=args.keep_tags)
+        if isinstance(transcriber, FusedTranscriber):
+            logging.getLogger("diarscribe").info(transcriber.summary())
+            transcriber.stats.clear()
         segments, stats = postprocess(segments, post_cfg)
         logging.getLogger("diarscribe").info(summary(stats))
         out_dir = args.output_dir or src.parent

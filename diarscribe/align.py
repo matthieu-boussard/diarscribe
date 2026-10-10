@@ -53,17 +53,16 @@ class Aligner:
         self.sep = vocab.get("|")
 
     @torch.inference_mode()
-    def align(self, audio: np.ndarray, start: float, end: float, text: str) -> list[Word]:
-        """Word timestamps (absolute seconds) for ``text`` spoken in ``audio[start:end]``."""
-        words = _attach_punctuation(text.split())
-        if not words:
-            return []
+    def emission(self, audio: np.ndarray, start: float, end: float) -> tuple[np.ndarray, float]:
+        """CTC log-probabilities (frames, vocab) of ``audio[start:end]``, and the frame duration in seconds."""
         seg = audio[int(start * self.sample_rate) : int(end * self.sample_rate)]
         inputs = self.processor(seg, sampling_rate=self.sample_rate, return_tensors="pt").to(self.device)
         emission = torch.log_softmax(self.model(**inputs).logits[0].float(), dim=-1).cpu().numpy()
-        frame_s = (len(seg) / self.sample_rate) / emission.shape[0]
+        return emission, (len(seg) / self.sample_rate) / emission.shape[0]
 
-        tokens, owner = [], []  # token ids, and the word index each token belongs to
+    def tokens(self, words: list[str]) -> tuple[list[int], list[int]]:
+        """CTC token ids for ``words`` (word separator between words), and the word index owning each token."""
+        tokens, owner = [], []
         for w_idx, w in enumerate(words):
             ids = [self.vocab[c] for c in self._normalize(w) if c in self.vocab]
             if ids and tokens and self.sep is not None:
@@ -71,6 +70,22 @@ class Aligner:
                 owner.append(-1)
             tokens += ids
             owner += [w_idx] * len(ids)
+        return tokens, owner
+
+    def score(self, emission: np.ndarray, words: list[str], token_bonus: float = 0.0) -> float:
+        """Viterbi log-likelihood of ``words`` given the audio (how well a transcription explains it), plus
+        ``token_bonus`` per CTC token: the best path favours blank on unclear speech, so without a bonus,
+        dropping words often "explains" conversational audio better than keeping them."""
+        tokens = self.tokens(words)[0]
+        return ctc_log_likelihood(emission, tokens, self.blank) + token_bonus * len(tokens)
+
+    def align(self, audio: np.ndarray, start: float, end: float, text: str) -> list[Word]:
+        """Word timestamps (absolute seconds) for ``text`` spoken in ``audio[start:end]``."""
+        words = _attach_punctuation(text.split())
+        if not words:
+            return []
+        emission, frame_s = self.emission(audio, start, end)
+        tokens, owner = self.tokens(words)
 
         spans = ctc_align(emission, tokens, self.blank) if tokens else None
         if spans is None:
@@ -95,6 +110,28 @@ class Aligner:
         return "".join(_CHAR_MAP.get(c, c) for c in word)
 
 
+def _trellis(emission: np.ndarray, tok: np.ndarray, blank: int) -> np.ndarray:
+    T, L = emission.shape[0], len(tok)
+    trellis = np.full((T + 1, L + 1), -np.inf)
+    trellis[0, 0] = 0.0
+    trellis[1:, 0] = np.cumsum(emission[:, blank])
+    for t in range(T):
+        stay = trellis[t, 1:] + np.maximum(emission[t, blank], emission[t, tok])
+        change = trellis[t, :-1] + emission[t, tok]
+        trellis[t + 1, 1:] = np.maximum(stay, change)
+    return trellis
+
+
+def ctc_log_likelihood(emission: np.ndarray, tokens: list[int], blank: int) -> float:
+    """Best-path log-likelihood of ``tokens`` over the whole ``emission`` (-inf if they cannot fit)."""
+    T, L = emission.shape[0], len(tokens)
+    if L == 0:
+        return float(emission[:, blank].sum())
+    if T < L:
+        return float("-inf")
+    return float(_trellis(emission, np.asarray(tokens), blank)[T, L])
+
+
 def ctc_align(emission: np.ndarray, tokens: list[int], blank: int) -> list[tuple[int, int]] | None:
     """Viterbi CTC forced alignment: (first_frame, last_frame) of each token, or None if impossible.
 
@@ -105,13 +142,7 @@ def ctc_align(emission: np.ndarray, tokens: list[int], blank: int) -> list[tuple
     if L == 0 or T < L:
         return None
     tok = np.asarray(tokens)
-    trellis = np.full((T + 1, L + 1), -np.inf)
-    trellis[0, 0] = 0.0
-    trellis[1:, 0] = np.cumsum(emission[:, blank])
-    for t in range(T):
-        stay = trellis[t, 1:] + np.maximum(emission[t, blank], emission[t, tok])
-        change = trellis[t, :-1] + emission[t, tok]
-        trellis[t + 1, 1:] = np.maximum(stay, change)
+    trellis = _trellis(emission, tok, blank)
     if not np.isfinite(trellis[T, L]):
         return None
 

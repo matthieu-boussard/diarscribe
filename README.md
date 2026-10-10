@@ -30,6 +30,7 @@ diarscribe reunion.m4a -v                        # français par défaut
 diarscribe *.wav --lang en -o transcripts/ --batch-size 32
 diarscribe reunion.m4a --asr vibevoice --context "boussard, craft ai, cabinet Liins, gestion de patrimoine"
 diarscribe reunion.m4a -g "Boussard, Craft AI, Craft, cabinet Liins" --style lu --numbers digits
+diarscribe *.wav --asr fusion -o transcripts/            # Cohere + Whisper, ~6,5 min par heure sur M4 Pro
 ```
 
 Sorties : `reunion.txt`, `reunion.srt`, `reunion.json` à côté du fichier (ou dans `-o DIR`).
@@ -57,6 +58,7 @@ Tous les moteurs partagent le reste du pipeline : fenêtres, garde anti-boucle, 
 | `cohere` (défaut) | Cohere Transcribe 03-2026 | 2B | non | imposée | 30 s | 16 |
 | `vibevoice` | VibeVoice-ASR | 7B | oui | auto | 30 s | 1 (24 Go de Mac) |
 | `whisper-fr` | Whisper large-v3 affiné en français | 1,5B | oui (`prompt_ids`) | imposée | 30 s | 16 |
+| `fusion` | Cohere + Whisper FR, désaccords tranchés par l'aligneur | 2B + 1,5B | oui (Whisper) | imposée | 30 s | 16 |
 
 Notes d'intégration :
 - **Whisper** : `generate` retire le token de fin de la ligne la plus longue du lot. La détection « budget de tokens épuisé » tient donc compte de la longueur réelle.
@@ -98,6 +100,32 @@ Hojo ↔ Cohere 33 %, Hojo ↔ Whisper 34 %, Hojo ↔ VibeVoice 35 %, et Granite
 - Diarisation des fichiers > 10 min : streaming par morceaux d'environ 27 s (au lieu des 0,72 s du mode « low_latency »), soit 18× plus rapide et plus proche du résultat offline.
 - Les tours de moins de 0,15 s sont ignorés. Un « Merci. » isolé sur un tour de moins d'une seconde est écarté : le décodeur en invente sur les clics et les respirations.
 - Les balises `[Silence]`, `[Noise]`… et les phrases-pièges connues (« Sous-titres réalisés par… ») sont retirées (`--keep-tags` pour garder les balises).
+
+## Fusion Cohere + Whisper (`--asr fusion`, `fusion.py`)
+
+Les deux modèles transcrivent les mêmes fenêtres, puis leurs textes sont alignés mot à mot. Pour chaque désaccord, l'aligneur
+wav2vec2 (un 3e modèle acoustique, indépendant des deux autres) calcule la vraisemblance CTC de la fenêtre avec
+chaque version. La version de Whisper n'est retenue que si elle explique nettement mieux l'audio (marge de 10).
+Sinon, Cohere l'emporte. Les simples variantes de nombre (« dix » / « 10 ») ne sont pas arbitrées.
+
+- **Bonus par caractère (6)** : sans lui, le meilleur chemin CTC préfère le silence sur la parole conversationnelle, et
+  la fusion supprimait de vrais fragments (« c'est bon. », « Non, non »). Le bonus et la marge ont été calibrés sur un
+  extrait de 5 min contre deux arbitres indépendants (VibeVoice, Hojo).
+- **Limite** : wav2vec2, entraîné sur de la parole lue, raisonne par caractères. Il retient parfois une graphie phonétique
+  fausse (un prénom remplacé par des mots qui sonnent pareil). La fusion améliore la moyenne, pas chaque décision.
+
+Évaluation sur 6 réunions (4 h 34). Sans transcription de référence, la mesure est la distance d'édition en mots
+aux deux arbitres indépendants (hésitations retirées, nombres en chiffres) :
+
+| Système | Temps (M4 Pro) | vs VibeVoice | vs Hojo | Moyenne | Meilleur sur |
+|---|---|---|---|---|---|
+| Cohere seul | 8 min 37 s | 24,8 % | 25,7 % | 25,3 % | 0 / 6 fichiers |
+| Whisper FR seul | 18 min 44 s | 23,1 % | 23,9 % | 23,5 % | 1 / 6 |
+| **Fusion** | 29 min 55 s | **22,6 %** | **23,2 %** | **22,9 %** | **5 / 6** |
+
+Whisper a été retenu dans 35 % des 4 243 désaccords. Comme VibeVoice et Hojo transcrivent « comme c'est dit » (« je sais
+pas »), comme Whisper, alors que Cohere normalise (« je ne sais pas »), une partie de l'écart mesuré tient au style
+et non à des erreurs. Sur l'extrait de 5 min, Cohere paraissait meilleur que Whisper ; l'échantillon de 4 h 34 est plus fiable.
 
 ## Post-traitement du texte (`postprocess.py`)
 
